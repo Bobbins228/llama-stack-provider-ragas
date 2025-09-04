@@ -1,6 +1,5 @@
 # TODO: decide how to treat these imports & possibly an extras_require
 import logging
-import subprocess
 import uuid
 from typing import Any
 
@@ -15,6 +14,9 @@ from llama_stack.providers.datatypes import BenchmarksProtocolPrivate
 from llama_stack_provider_ragas.config import RagasProviderRemoteConfig
 from llama_stack_provider_ragas.errors import RagasEvaluationError
 from llama_stack_provider_ragas.logging_utils import render_dataframe_as_table
+
+from kubernetes import config as k8s_config
+from kubernetes.client import configuration
 
 logger = logging.getLogger(__name__)
 
@@ -35,20 +37,28 @@ class RagasEvaluatorRemote(Eval, BenchmarksProtocolPrivate):
         self.config = config
         self.evaluation_jobs: dict[str, RagasEvaluationJob] = {}
         self.benchmarks: dict[str, Benchmark] = {}
+
+        try:
+            k8s_config.load_kube_config()
+            logger.info("Loaded Kubernetes config from kubeconfig file")
+        except Exception as e:
+            logger.info(f"Failed to load kubeconfig ({str(e)}), falling back to in-cluster config")
+            try:
+                k8s_config.load_incluster_config()
+                logger.info("Loaded Kubernetes in-cluster config")
+            except Exception as cluster_e:
+                logger.warning(f"Failed to load in-cluster config: {str(cluster_e)}")
         try:
             import kfp
 
-            result = subprocess.run(
-                ["oc", "whoami", "-t"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=5,
+            k8s_configuration = configuration.Configuration.get_default_copy()
+            token = k8s_configuration.configuration.get_api_key_with_prefix(
+                "authorization"
             )
-            token = result.stdout.strip()
+            
             if not token:
                 raise RagasEvaluationError(
-                    "No token found. Please run `oc login` and try again."
+                    "No token found in Kubernetes config. Please ensure you're authenticated to the cluster."
                 )
 
             # the kfp.Client handles the healthz endpoint poorly, run a pre-flight check manually
@@ -70,9 +80,9 @@ class RagasEvaluatorRemote(Eval, BenchmarksProtocolPrivate):
             raise RagasEvaluationError(
                 "Kubeflow Pipelines SDK not available. Install with: pip install .[remote]"
             ) from e
-        except subprocess.CalledProcessError as e:
+        except AttributeError as e:
             raise RagasEvaluationError(
-                f"Failed to get OpenShift token. Command failed with exit code {e.returncode}: {e.stderr.strip()}"
+                "Failed to extract token from Kubernetes config. Ensure you're authenticated to the cluster."
             ) from e
         except requests.exceptions.RequestException as e:
             raise RagasEvaluationError(
